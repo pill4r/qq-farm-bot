@@ -21,7 +21,26 @@ const { initStatusBar, cleanupStatusBar, setStatusPlatform } = require('./src/st
 const { startSellLoop, stopSellLoop, debugSellFruits } = require('./src/warehouse');
 const { processInviteCodes } = require('./src/invite');
 const { verifyMode, decodeMode } = require('./src/decode');
-const { emitRuntimeHint, sleep } = require('./src/utils');
+const { emitRuntimeHint } = require('./src/utils');
+const fs = require('fs');
+const CODE_FILE = './code.txt';
+
+function loadCodeFromFile() {
+    try {
+        if (fs.existsSync(CODE_FILE)) {
+            const code = fs.readFileSync(CODE_FILE, 'utf8').trim();
+            if (code) return code;
+        }
+    } catch (e) { }
+    return null;
+}
+
+function saveCodeToFile(code) {
+    try {
+        fs.writeFileSync(CODE_FILE, code, 'utf8');
+    } catch (e) { }
+}
+
 const { getQQFarmCodeByScan } = require('./src/qqQrLogin');
 const { initFileLogger } = require('./src/logger');
 
@@ -40,13 +59,16 @@ QQ经典农场 挂机脚本
   node client.js --decode <数据> [--hex] [--gate] [--type <消息类型>]
 
 参数:
-  --code              小程序 login() 返回的临时凭证 (必需)
+  --code              小程序 login() 返回的临时凭证 (可选，有保存则自动使用)
   --qr                启动后使用QQ扫码获取登录code（仅QQ平台）
   --wx                使用微信登录 (默认为QQ小程序)
   --interval          自己农场巡查完成后等待秒数, 默认10秒, 最低10秒
   --friend-interval   好友巡查完成后等待秒数, 默认1秒, 最低1秒
   --verify            验证proto定义
   --decode            解码PB数据 (运行 --decode 无参数查看详细帮助)
+
+代码文件:
+  code.txt           QQ平台自动保存/读取登录凭证 (仅QQ平台)
 
 功能:
   - 自动收获成熟作物 → 购买种子 → 种植 → 施肥
@@ -120,6 +142,15 @@ async function main() {
     // 正常挂机模式
     const options = parseArgs(args);
 
+    // 尝试从文件读取保存的 code
+    if (!options.code) {
+        const savedCode = loadCodeFromFile();
+        if (savedCode) {
+            console.log(`[登录] 已自动读取保存的 code=${savedCode.substring(0, 8)}...`);
+            options.code = savedCode;
+        }
+    }
+
     // QQ 平台支持扫码登录: 显式 --qr，或未传 --code 时自动触发
     if (!options.code && CONFIG.platform === 'qq' && (options.qrLogin || !args.includes('--code'))) {
         console.log('[扫码登录] 正在获取二维码...');
@@ -156,6 +187,11 @@ async function main() {
 
     // 连接并登录，登录成功后启动各功能模块
     connect(options.code, async () => {
+        // 保存 code 到文件（QQ 平台可复用）
+        if (CONFIG.platform === 'qq') {
+            saveCodeToFile(options.code);
+        }
+        
         // 处理邀请码 (仅微信环境)
         await processInviteCodes();
         
