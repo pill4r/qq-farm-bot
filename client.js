@@ -1,6 +1,10 @@
 /**
  * QQ经典农场 挂机脚本 - 入口文件
  *
+ * 运行模式:
+ *   1. 持续在线模式 (默认): 长连接，持续运行所有自动化功能
+ *   2. 按需模式: 根据成熟时间定时唤醒，操作后退出
+ *
  * 模块结构:
  *   src/config.js   - 配置常量与枚举
  *   src/utils.js    - 通用工具函数
@@ -9,6 +13,9 @@
  *   src/farm.js     - 自己农场操作与巡田循环
  *   src/friend.js   - 好友农场操作与巡查循环
  *   src/decode.js   - PB解码/验证工具模式
+ *   src/db/         - 数据库层 (按需模式)
+ *   src/worker/     - Worker (按需模式)
+ *   src/scheduler/  - 调度器 (按需模式)
  */
 
 const { CONFIG } = require('./src/config');
@@ -50,11 +57,17 @@ initFileLogger();
 function showHelp() {
     console.log(`
 QQ经典农场 挂机脚本
-====================
+===================
 
 用法:
+  # 持续在线模式 (默认)
   node client.js --code <登录code> [--wx] [--interval <秒>] [--friend-interval <秒>]
   node client.js --qr [--interval <秒>] [--friend-interval <秒>]
+
+  # 按需模式 (使用数据库调度)
+  node client.js --mode on-demand --user-id <user_id>
+
+  # 工具模式
   node client.js --verify
   node client.js --decode <数据> [--hex] [--gate] [--type <消息类型>]
 
@@ -64,6 +77,8 @@ QQ经典农场 挂机脚本
   --wx                使用微信登录 (默认为QQ小程序)
   --interval          自己农场巡查完成后等待秒数, 默认10秒, 最低10秒
   --friend-interval   好友巡查完成后等待秒数, 默认1秒, 最低1秒
+  --mode              运行模式: always-on (默认) | on-demand
+  --user-id           按需模式下的用户ID
   --verify            验证proto定义
   --decode            解码PB数据 (运行 --decode 无参数查看详细帮助)
 
@@ -80,6 +95,14 @@ QQ经典农场 挂机脚本
   - 启动时读取 share.txt 处理邀请码 (仅微信)
   - 心跳保活
 
+按需模式命令 (使用 cmd.js):
+  node cmd.js add-user --code <code> [--name <name>]  添加用户
+  node cmd.js list                               列出用户
+  node cmd.js remove <user_id>                   删除用户
+  node cmd.js run <user_id>                      手动运行一次
+  node cmd.js start                              启动调度器
+  node cmd.js stop                               停止调度器
+
 邀请码文件 (share.txt):
   每行一个邀请链接，格式: ?uid=xxx&openid=xxx&share_source=xxx&doc_id=xxx
   启动时会尝试通过 SyncAll API 同步这些好友
@@ -95,6 +118,8 @@ function parseArgs(args) {
         name: '',
         certId: '',
         certType: 0,
+        mode: 'always-on',  // always-on | on-demand
+        userId: null,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -113,7 +138,21 @@ function parseArgs(args) {
         }
         if (args[i] === '--friend-interval' && args[i + 1]) {
             const sec = parseInt(args[++i]);
-            CONFIG.friendCheckInterval = Math.max(sec, 1) * 1000;  // 最低1秒
+            CONFIG.friendCheckInterval = Math.max(sec, 1) * 1000;
+        }
+        if (args[i] === '--mode' && args[i + 1]) {
+            options.mode = args[++i];
+    // QQ 平台支持扫码登录: 显式 --qr，或未传 --code 时自动触发
+    // if (!options.code && CONFIG.platform === 'qq' && (options.qrLogin || !args.includes('--code'))) {
+    //     console.log('[扫码登录] 正在获取二维码...');
+    //     options.code = await getQQFarmCodeByScan();
+    //     usedQrLogin = true;
+    //     console.log(`[扫码登录] 获取成功，code=${options.code.substring(0, 8)}...`);
+    // }
+
+        }
+        if (args[i] === '--user-id' && args[i + 1]) {
+            options.userId = parseInt(args[++i]);
         }
     }
     return options;
@@ -139,8 +178,14 @@ async function main() {
         return;
     }
 
-    // 正常挂机模式
+    // 按需模式
     const options = parseArgs(args);
+    if (options.mode === 'on-demand') {
+        await runOnDemandMode(options);
+        return;
+    }
+
+    // 正常挂机模式 (持续在线)
 
     // 尝试从文件读取保存的 code
     if (!options.code) {
@@ -217,6 +262,42 @@ async function main() {
         if (ws) ws.close();
         process.exit(0);
     });
+}
+
+// ============ 按需模式 ============
+async function runOnDemandMode(options) {
+    const { initDb } = require('./src/db');
+    const UserWorker = require('./src/worker/userWorker');
+    const scheduler = require('./src/scheduler');
+    const dbUser = require('./src/db/user');
+
+    await initDb();
+
+    if (options.userId) {
+        const user = dbUser.getUser(options.userId);
+        if (!user) {
+            console.error(`错误: 用户 ${options.userId} 不存在`);
+            console.log('使用 node cmd.js list 查看用户列表');
+            process.exit(1);
+        }
+
+        console.log(`[按需模式] 运行用户 ${options.userId} (${user.name || '未设置昵称'})`);
+        
+        const worker = new UserWorker(options.userId);
+        await worker.run();
+        
+        console.log('[按需模式] 运行完成');
+        process.exit(0);
+    } else {
+        console.log('[按需模式] 启动调度器...');
+        scheduler.startScheduler();
+        
+        process.on('SIGINT', () => {
+            console.log('\n[按需模式] 正在停止...');
+            scheduler.stopScheduler();
+            process.exit(0);
+        });
+    }
 }
 
 main().catch(err => {

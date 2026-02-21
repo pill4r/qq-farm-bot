@@ -605,8 +605,341 @@ function stopFarmCheckLoop() {
     networkEvents.removeListener('landsChanged', onLandsChangedPush);
 }
 
+// ============ 按需调用函数 ============
+
+async function checkAndOperateFarm(network, userId) {
+    const { toLong, toNum, getServerTimeSec, toTimeSec, log: farmLog, logWarn, sleep } = require('./utils');
+    const { getPlantNameBySeedId, getPlantName, getPlantExp, formatGrowTime, getPlantGrowTime, getItemName } = require('./gameConfig');
+    const { getPlantingRecommendation } = require('../tools/calc-exp-yield');
+    const dbMyLand = require('./db/myLand');
+
+    const state = network.getUserState();
+    const log = (tag, msg) => farmLog(`[${state.name}] ${tag}`, msg);
+
+    async function getAllLands() {
+        const body = types.AllLandsRequest.encode(types.AllLandsRequest.create({})).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'AllLands', body);
+        return types.AllLandsReply.decode(replyBody);
+    }
+
+    async function harvest(landIds) {
+        const body = types.HarvestRequest.encode(types.HarvestRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(state.gid),
+            is_all: true,
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'Harvest', body);
+        return types.HarvestReply.decode(replyBody);
+    }
+
+    async function water(landIds) {
+        const body = types.WaterLandRequest.encode(types.WaterLandRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(state.gid),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'WaterLand', body);
+        return types.WaterLandReply.decode(replyBody);
+    }
+
+    async function weedOutOp(landIds) {
+        const body = types.WeedOutRequest.encode(types.WeedOutRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(state.gid),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'WeedOut', body);
+        return types.WeedOutReply.decode(replyBody);
+    }
+
+    async function insecticideOp(landIds) {
+        const body = types.InsecticideRequest.encode(types.InsecticideRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(state.gid),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'Insecticide', body);
+        return types.InsecticideReply.decode(replyBody);
+    }
+
+    async function removePlant(landIds) {
+        const body = types.RemovePlantRequest.encode(types.RemovePlantRequest.create({
+            land_ids: landIds.map(id => toLong(id)),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'RemovePlant', body);
+        return types.RemovePlantReply.decode(replyBody);
+    }
+
+    async function getShopInfo(shopId) {
+        const body = types.ShopInfoRequest.encode(types.ShopInfoRequest.create({
+            shop_id: toLong(shopId),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.shoppb.ShopService', 'ShopInfo', body);
+        return types.ShopInfoReply.decode(replyBody);
+    }
+
+    async function buyGoods(goodsId, num, price) {
+        const body = types.BuyGoodsRequest.encode(types.BuyGoodsRequest.create({
+            goods_id: toLong(goodsId),
+            num: toLong(num),
+            price: toLong(price),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.shoppb.ShopService', 'BuyGoods', body);
+        return types.BuyGoodsReply.decode(replyBody);
+    }
+
+    function encodePlantRequest(seedId, landIds) {
+        const writer = protobuf.Writer.create();
+        const itemWriter = writer.uint32(18).fork();
+        itemWriter.uint32(8).int64(seedId);
+        const idsWriter = itemWriter.uint32(18).fork();
+        for (const id of landIds) {
+            idsWriter.int64(id);
+        }
+        idsWriter.ldelim();
+        itemWriter.ldelim();
+        return writer.finish();
+    }
+
+    async function plantSeeds(seedId, landIds) {
+        let successCount = 0;
+        for (const landId of landIds) {
+            try {
+                const body = encodePlantRequest(seedId, [landId]);
+                const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'Plant', body);
+                types.PlantReply.decode(replyBody);
+                successCount++;
+            } catch (e) {
+                logWarn('种植', `土地#${landId} 失败: ${e.message}`);
+            }
+            if (landIds.length > 1) await sleep(50);
+        }
+        return successCount;
+    }
+
+    async function fertilize(landIds, fertilizerId = 1011) {
+        let successCount = 0;
+        for (const landId of landIds) {
+            try {
+                const body = types.FertilizeRequest.encode(types.FertilizeRequest.create({
+                    land_ids: [toLong(landId)],
+                    fertilizer_id: toLong(fertilizerId),
+                })).finish();
+                await network.sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', body);
+                successCount++;
+            } catch (e) {
+                break;
+            }
+            if (landIds.length > 1) await sleep(50);
+        }
+        return successCount;
+    }
+
+    function analyzeMyLands(lands) {
+        const nowSec = getServerTimeSec();
+        const result = {
+            harvestable: [], needWater: [], needWeed: [], needBug: [],
+            growing: [], empty: [], dead: [],
+        };
+
+        for (const land of lands) {
+            const id = toNum(land.id);
+            if (!land.unlocked) continue;
+
+            const plant = land.plant;
+            if (!plant || !plant.phases || plant.phases.length === 0) {
+                result.empty.push(id);
+                continue;
+            }
+
+            let matureTime = 0;
+            for (const phase of plant.phases) {
+                if (phase.phase === PlantPhase.MATURE) {
+                    matureTime = toTimeSec(phase.begin_time);
+                    break;
+                }
+            }
+
+            const currentPhase = getCurrentPhase(plant.phases, false, '');
+            if (!currentPhase) {
+                result.empty.push(id);
+                continue;
+            }
+
+            const phaseVal = currentPhase.phase;
+            const needWater = toNum(plant.dry_num) > 0 || (toTimeSec(currentPhase.dry_time) > 0 && toTimeSec(currentPhase.dry_time) <= nowSec);
+            const needWeed = (plant.weed_owners && plant.weed_owners.length > 0) || (toTimeSec(currentPhase.weeds_time) > 0 && toTimeSec(currentPhase.weeds_time) <= nowSec);
+            const needBug = (plant.insect_owners && plant.insect_owners.length > 0) || (toTimeSec(currentPhase.insect_time) > 0 && toTimeSec(currentPhase.insect_time) <= nowSec);
+
+            dbMyLand.upsertMyLand(userId, id, toNum(plant.id), plant.name, matureTime, phaseVal, needWater, needWeed, needBug);
+
+            if (phaseVal === PlantPhase.DEAD) {
+                result.dead.push(id);
+                continue;
+            }
+
+            if (phaseVal === PlantPhase.MATURE) {
+                result.harvestable.push(id);
+                continue;
+            }
+
+            if (needWater) result.needWater.push(id);
+            if (needWeed) result.needWeed.push(id);
+            if (needBug) result.needBug.push(id);
+            result.growing.push(id);
+        }
+
+        return result;
+    }
+
+    async function findBestSeed(landsCount) {
+        const shopReply = await getShopInfo(2);
+        if (!shopReply.goods_list || shopReply.goods_list.length === 0) {
+            return null;
+        }
+
+        const available = [];
+        for (const goods of shopReply.goods_list) {
+            if (!goods.unlocked) continue;
+
+            let meetsConditions = true;
+            let requiredLevel = 0;
+            const conds = goods.conds || [];
+            for (const cond of conds) {
+                if (toNum(cond.type) === 1) {
+                    requiredLevel = toNum(cond.param);
+                    if (state.level < requiredLevel) {
+                        meetsConditions = false;
+                        break;
+                    }
+                }
+            }
+            if (!meetsConditions) continue;
+
+            const limitCount = toNum(goods.limit_count);
+            const boughtNum = toNum(goods.bought_num);
+            if (limitCount > 0 && boughtNum >= limitCount) continue;
+
+            available.push({
+                goods,
+                goodsId: toNum(goods.id),
+                seedId: toNum(goods.item_id),
+                price: toNum(goods.price),
+                requiredLevel,
+            });
+        }
+
+        if (available.length === 0) return null;
+
+        if (CONFIG.forceLowestLevelCrop) {
+            available.sort((a, b) => a.requiredLevel - b.requiredLevel || a.price - b.price);
+            return available[0];
+        }
+
+        try {
+            const rec = getPlantingRecommendation(state.level, landsCount == null ? 18 : landsCount, { top: 50 });
+            const rankedSeedIds = rec.candidatesNormalFert.map(x => x.seedId);
+            for (const seedId of rankedSeedIds) {
+                const hit = available.find(x => x.seedId === seedId);
+                if (hit) return hit;
+            }
+        } catch (e) { }
+
+        if (state.level && state.level <= 28) {
+            available.sort((a, b) => a.requiredLevel - b.requiredLevel);
+        } else {
+            available.sort((a, b) => b.requiredLevel - a.requiredLevel);
+        }
+        return available[0];
+    }
+
+    async function autoPlant(deadLandIds, emptyLandIds, unlockedLandCount) {
+        let landsToPlant = [...emptyLandIds];
+
+        if (deadLandIds.length > 0) {
+            try {
+                await removePlant(deadLandIds);
+                log('铲除', `${deadLandIds.length} 块`);
+                landsToPlant.push(...deadLandIds);
+            } catch (e) {
+                landsToPlant.push(...deadLandIds);
+            }
+        }
+
+        if (landsToPlant.length === 0) return;
+
+        const bestSeed = await findBestSeed(unlockedLandCount);
+        if (!bestSeed) return;
+
+        const needCount = landsToPlant.length;
+        const totalCost = bestSeed.price * needCount;
+        if (totalCost > state.gold) {
+            const canBuy = Math.floor(state.gold / bestSeed.price);
+            if (canBuy <= 0) return;
+            landsToPlant = landsToPlant.slice(0, canBuy);
+        }
+
+        try {
+            await buyGoods(bestSeed.goodsId, landsToPlant.length, bestSeed.price);
+            const planted = await plantSeeds(bestSeed.seedId, landsToPlant);
+            if (planted > 0) {
+                await fertilize(landsToPlant.slice(0, planted));
+            }
+            log('种植', `${planted} 块`);
+        } catch (e) {
+            logWarn('种植', e.message);
+        }
+    }
+
+    try {
+        const landsReply = await getAllLands();
+        if (!landsReply.lands || landsReply.lands.length === 0) {
+            log('农场', '无土地数据');
+            return;
+        }
+
+        const lands = landsReply.lands;
+        const status = analyzeMyLands(lands);
+        const unlockedLandCount = lands.filter(land => land && land.unlocked).length;
+
+        const actions = [];
+
+        if (status.needWeed.length > 0) {
+            try { await weedOutOp(status.needWeed); actions.push(`除草${status.needWeed.length}`); } catch (e) { }
+        }
+        if (status.needBug.length > 0) {
+            try { await insecticideOp(status.needBug); actions.push(`除虫${status.needBug.length}`); } catch (e) { }
+        }
+        if (status.needWater.length > 0) {
+            try { await water(status.needWater); actions.push(`浇水${status.needWater.length}`); } catch (e) { }
+        }
+
+        let harvestedLandIds = [];
+        if (status.harvestable.length > 0) {
+            try {
+                await harvest(status.harvestable);
+                actions.push(`收获${status.harvestable.length}`);
+                harvestedLandIds = [...status.harvestable];
+            } catch (e) { }
+        }
+
+        const allDeadLands = [...status.dead, ...harvestedLandIds];
+        const allEmptyLands = [...status.empty];
+        if (allDeadLands.length > 0 || allEmptyLands.length > 0) {
+            try {
+                await autoPlant(allDeadLands, allEmptyLands, unlockedLandCount);
+                actions.push(`种${allDeadLands.length + allEmptyLands.length}`);
+            } catch (e) { }
+        }
+
+        if (actions.length > 0) {
+            log('农场', actions.join('/'));
+        }
+    } catch (err) {
+        logWarn('农场', err.message);
+    }
+}
+
 module.exports = {
     checkFarm, startFarmCheckLoop, stopFarmCheckLoop,
     getCurrentPhase,
     setOperationLimitsCallback,
+    checkAndOperateFarm,
 };

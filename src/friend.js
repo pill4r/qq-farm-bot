@@ -709,7 +709,201 @@ async function acceptFriendsWithRetry(gids) {
     }
 }
 
+// ============ 按需调用函数 ============
+
+async function scanAndSteal(network, userId) {
+    const { toLong, toNum, getServerTimeSec, toTimeSec, log: friendLog, logWarn, sleep } = require('./utils');
+    const { getPlantName } = require('./gameConfig');
+    const dbFriend = require('./db/friend');
+    const dbFriendLand = require('./db/friendLand');
+
+    const state = network.getUserState();
+    const log = (tag, msg) => friendLog(`[${state.name}] ${tag}`, msg);
+
+    async function getAllFriends() {
+        const body = types.GetAllFriendsRequest.encode(types.GetAllFriendsRequest.create({})).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.friendpb.FriendService', 'GetAll', body);
+        return types.GetAllFriendsReply.decode(replyBody);
+    }
+
+    async function enterFriend(friendGid) {
+        const body = types.VisitEnterRequest.encode(types.VisitEnterRequest.create({
+            host_gid: toLong(friendGid),
+            reason: 2,
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.visitpb.VisitService', 'Enter', body);
+        return types.VisitEnterReply.decode(replyBody);
+    }
+
+    async function leaveFriend(friendGid) {
+        try {
+            const body = types.VisitLeaveRequest.encode(types.VisitLeaveRequest.create({
+                host_gid: toLong(friendGid),
+            })).finish();
+            await network.sendMsgAsync('gamepb.visitpb.VisitService', 'Leave', body);
+        } catch (e) { }
+    }
+
+    async function steal(friendGid, landIds) {
+        const body = types.HarvestRequest.encode(types.HarvestRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(friendGid),
+            is_all: true,
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'Harvest', body);
+        return types.HarvestReply.decode(replyBody);
+    }
+
+    async function helpWater(friendGid, landIds) {
+        const body = types.WaterLandRequest.encode(types.WaterLandRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(friendGid),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'WaterLand', body);
+        return types.WaterLandReply.decode(replyBody);
+    }
+
+    async function helpWeed(friendGid, landIds) {
+        const body = types.WeedOutRequest.encode(types.WeedOutRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(friendGid),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'WeedOut', body);
+        return types.WeedOutReply.decode(replyBody);
+    }
+
+    async function helpInsecticide(friendGid, landIds) {
+        const body = types.InsecticideRequest.encode(types.InsecticideRequest.create({
+            land_ids: landIds,
+            host_gid: toLong(friendGid),
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.plantpb.PlantService', 'Insecticide', body);
+        return types.InsecticideReply.decode(replyBody);
+    }
+
+    function analyzeFriendLands(lands, myGid) {
+        const nowSec = getServerTimeSec();
+        const result = {
+            stealable: [],
+            needWater: [],
+            needWeed: [],
+            needBug: [],
+        };
+
+        for (const land of lands) {
+            const id = toNum(land.id);
+            const plant = land.plant;
+            if (!plant || !plant.phases || plant.phases.length === 0) continue;
+
+            let matureTime = 0;
+            for (const phase of plant.phases) {
+                if (phase.phase === PlantPhase.MATURE) {
+                    matureTime = toTimeSec(phase.begin_time);
+                    break;
+                }
+            }
+
+            const currentPhase = getCurrentPhase(plant.phases, false, '');
+            if (!currentPhase) continue;
+
+            const phaseVal = currentPhase.phase;
+
+            if (phaseVal === PlantPhase.MATURE && plant.stealable) {
+                result.stealable.push({ landId: id, plantId: toNum(plant.id), name: getPlantName(toNum(plant.id)) || plant.name });
+                dbFriendLand.upsertFriendLand(0, id, toNum(plant.id), plant.name, matureTime);
+                continue;
+            }
+
+            if (phaseVal === PlantPhase.DEAD) continue;
+
+            const needWater = toNum(plant.dry_num) > 0 || (toTimeSec(currentPhase.dry_time) > 0 && toTimeSec(currentPhase.dry_time) <= nowSec);
+            const needWeed = (plant.weed_owners && plant.weed_owners.length > 0) || (toTimeSec(currentPhase.weeds_time) > 0 && toTimeSec(currentPhase.weeds_time) <= nowSec);
+            const needBug = (plant.insect_owners && plant.insect_owners.length > 0) || (toTimeSec(currentPhase.insect_time) > 0 && toTimeSec(currentPhase.insect_time) <= nowSec);
+
+            if (needWater) result.needWater.push(id);
+            if (needWeed) result.needWeed.push(id);
+            if (needBug) result.needBug.push(id);
+        }
+
+        return result;
+    }
+
+    try {
+        const friendsReply = await getAllFriends();
+        const friends = friendsReply.game_friends || [];
+        if (friends.length === 0) {
+            log('好友', '无好友');
+            return;
+        }
+
+        let totalSteal = 0;
+        let totalHelp = 0;
+
+        for (const f of friends) {
+            const gid = toNum(f.gid);
+            if (gid === state.gid) continue;
+
+            const name = f.remark || f.name || `GID:${gid}`;
+            
+            dbFriend.upsertFriend(userId, gid, name, toNum(f.level));
+
+            const friendInfo = dbFriend.getFriend(userId, gid);
+            if (!friendInfo) continue;
+
+            try {
+                const enterReply = await enterFriend(gid);
+                const lands = enterReply.lands || [];
+                if (lands.length === 0) {
+                    await leaveFriend(gid);
+                    continue;
+                }
+
+                const status = analyzeFriendLands(lands, state.gid);
+                const actions = [];
+
+                if (status.needWeed.length > 0) {
+                    try { await helpWeed(gid, status.needWeed); actions.push(`草${status.needWeed.length}`); totalHelp++; } catch (e) { }
+                }
+                if (status.needBug.length > 0) {
+                    try { await helpInsecticide(gid, status.needBug); actions.push(`虫${status.needBug.length}`); totalHelp++; } catch (e) { }
+                }
+                if (status.needWater.length > 0) {
+                    try { await helpWater(gid, status.needWater); actions.push(`水${status.needWater.length}`); totalHelp++; } catch (e) { }
+                }
+
+                if (status.stealable.length > 0) {
+                    const landIds = status.stealable.map(s => s.landId);
+                    try {
+                        await steal(gid, landIds);
+                        actions.push(`偷${status.stealable.length}`);
+                        totalSteal += status.stealable.length;
+                        for (const s of status.stealable) {
+                            dbFriendLand.updateLastStealTime(friendInfo.id, s.landId);
+                        }
+                    } catch (e) { }
+                }
+
+                if (actions.length > 0) {
+                    log('好友', `${name}: ${actions.join('/')}`);
+                }
+
+                await leaveFriend(gid);
+                await sleep(300);
+            } catch (e) {
+                logWarn('好友', `${name}: ${e.message}`);
+            }
+        }
+
+        if (totalSteal > 0 || totalHelp > 0) {
+            log('好友', `巡查完成: 偷${totalSteal}/帮${totalHelp}`);
+        }
+    } catch (err) {
+        logWarn('好友', err.message);
+    }
+}
+
 module.exports = {
     checkFriends, startFriendCheckLoop, stopFriendCheckLoop,
     checkAndAcceptApplications,
+    scanAndSteal,
 };

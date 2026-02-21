@@ -162,6 +162,78 @@ function stopSellLoop() {
     }
 }
 
+// ============ 按需调用函数 ============
+
+async function sellFruits(network) {
+    const { toLong, toNum, log: warehouseLog, logWarn } = require('./utils');
+    const { getFruitName } = require('./gameConfig');
+
+    const state = network.getUserState();
+    const log = (tag, msg) => warehouseLog(`[${state.name}] ${tag}`, msg);
+
+    async function getBag() {
+        const body = types.BagRequest.encode(types.BagRequest.create({})).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.itempb.ItemService', 'Bag', body);
+        return types.BagReply.decode(replyBody);
+    }
+
+    function toSellItem(item) {
+        const id = item.id != null ? toLong(item.id) : undefined;
+        const count = item.count != null ? toLong(item.count) : undefined;
+        const uid = item.uid != null ? toLong(item.uid) : undefined;
+        return { id, count, uid };
+    }
+
+    async function sellItems(items) {
+        const payload = items.map(toSellItem);
+        const body = types.SellRequest.encode(types.SellRequest.create({ items: payload })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.itempb.ItemService', 'Sell', body);
+        return types.SellReply.decode(replyBody);
+    }
+
+    function getBagItems(bagReply) {
+        if (bagReply.item_bag && bagReply.item_bag.items && bagReply.item_bag.items.length)
+            return bagReply.item_bag.items;
+        return bagReply.items || [];
+    }
+
+    function extractGold(sellReply) {
+        if (sellReply.get_items && sellReply.get_items.length > 0) {
+            for (const item of sellReply.get_items) {
+                const id = toNum(item.id);
+                if (id === GOLD_ITEM_ID) {
+                    return toNum(item.count);
+                }
+            }
+            return 0;
+        }
+        return 0;
+    }
+
+    try {
+        const bagReply = await getBag();
+        const items = getBagItems(bagReply);
+
+        const toSell = [];
+        for (const item of items) {
+            const id = toNum(item.id);
+            const count = toNum(item.count);
+            const uid = item.uid ? toNum(item.uid) : 0;
+            if (isFruitIdBySeedData(id) && count > 0 && uid > 0) {
+                toSell.push(item);
+            }
+        }
+
+        if (toSell.length === 0) return;
+
+        const reply = await sellItems(toSell);
+        const totalGold = extractGold(reply);
+        log('仓库', `出售获得 ${totalGold} 金币`);
+    } catch (e) {
+        logWarn('仓库', e.message);
+    }
+}
+
 module.exports = {
     getBag,
     sellItems,
@@ -170,4 +242,5 @@ module.exports = {
     getBagItems,
     startSellLoop,
     stopSellLoop,
+    sellFruits,
 };

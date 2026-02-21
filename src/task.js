@@ -175,8 +175,90 @@ function cleanupTaskSystem() {
     networkEvents.off('taskInfoNotify', onTaskInfoNotify);
 }
 
+// ============ 按需调用函数 ============
+
+async function claimTasks(network) {
+    const { toLong, toNum, log: taskLog, logWarn, sleep } = require('./utils');
+    const { getItemName } = require('./gameConfig');
+
+    const state = network.getUserState();
+    const log = (tag, msg) => taskLog(`[${state.name}] ${tag}`, msg);
+
+    async function getTaskInfo() {
+        const body = types.TaskInfoRequest.encode(types.TaskInfoRequest.create({})).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.taskpb.TaskService', 'TaskInfo', body);
+        return types.TaskInfoReply.decode(replyBody);
+    }
+
+    async function claimTaskReward(taskId, doShared = false) {
+        const body = types.ClaimTaskRewardRequest.encode(types.ClaimTaskRewardRequest.create({
+            id: toLong(taskId),
+            do_shared: doShared,
+        })).finish();
+        const { body: replyBody } = await network.sendMsgAsync('gamepb.taskpb.TaskService', 'ClaimTaskReward', body);
+        return types.ClaimTaskRewardReply.decode(replyBody);
+    }
+
+    function getRewardSummary(items) {
+        const summary = [];
+        for (const item of items) {
+            const id = toNum(item.id);
+            const count = toNum(item.count);
+            if (id === 1) summary.push(`金币${count}`);
+            else if (id === 2) summary.push(`经验${count}`);
+            else summary.push(`${getItemName(id)}(${id})x${count}`);
+        }
+        return summary.join('/');
+    }
+
+    try {
+        const reply = await getTaskInfo();
+        if (!reply.task_info) return;
+
+        const taskInfo = reply.task_info;
+        const allTasks = [
+            ...(taskInfo.growth_tasks || []),
+            ...(taskInfo.daily_tasks || []),
+            ...(taskInfo.tasks || []),
+        ];
+
+        const claimable = [];
+        for (const task of allTasks) {
+            const progress = toNum(task.progress);
+            const totalProgress = toNum(task.total_progress);
+            if (task.is_unlocked && !task.is_claimed && progress >= totalProgress && totalProgress > 0) {
+                claimable.push({
+                    id: toNum(task.id),
+                    desc: task.desc || `任务#${task.id}`,
+                    shareMultiple: toNum(task.share_multiple),
+                });
+            }
+        }
+
+        if (claimable.length === 0) return;
+
+        log('任务', `${claimable.length} 个可领取`);
+
+        for (const task of claimable) {
+            try {
+                const useShare = task.shareMultiple > 1;
+                const claimReply = await claimTaskReward(task.id, useShare);
+                const items = claimReply.items || [];
+                const rewardStr = items.length > 0 ? getRewardSummary(items) : '无';
+                log('任务', `${task.desc}${useShare ? ` (${task.shareMultiple}倍)` : ''} → ${rewardStr}`);
+                await sleep(300);
+            } catch (e) {
+                logWarn('任务', `领取失败: ${e.message}`);
+            }
+        }
+    } catch (e) {
+        logWarn('任务', e.message);
+    }
+}
+
 module.exports = {
     checkAndClaimTasks,
     initTaskSystem,
     cleanupTaskSystem,
+    claimTasks,
 };
