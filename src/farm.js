@@ -537,8 +537,29 @@ async function checkFarm() {
         }
 
         // 铲除 + 种植 + 施肥（需要顺序执行）
-        const allDeadLands = [...status.dead, ...harvestedLandIds];
+        const allDeadLands = [...status.dead];
         const allEmptyLands = [...status.empty];
+
+        // 收获后重新检测土地状态，避免两季作物被误铲
+        if (harvestedLandIds.length > 0) {
+            try {
+                const refreshedReply = await getAllLands();
+                if (refreshedReply.lands && refreshedReply.lands.length > 0) {
+                    const refreshedStatus = analyzeLands(refreshedReply.lands);
+                    for (const hid of harvestedLandIds) {
+                        if (refreshedStatus.empty.includes(hid)) {
+                            allEmptyLands.push(hid);
+                        } else if (refreshedStatus.dead.includes(hid)) {
+                            allDeadLands.push(hid);
+                        }
+                        // 仍在生长中（两季作物第二季）→ 不处理，等下次巡查
+                    }
+                }
+            } catch (e) {
+                logWarn('巡田', `收获后刷新土地状态失败: ${e.message}，跳过收获地块的后续处理`);
+            }
+        }
+
         if (allDeadLands.length > 0 || allEmptyLands.length > 0) {
             try {
                 await autoPlantEmptyLands(allDeadLands, allEmptyLands, unlockedLandCount);
